@@ -28,7 +28,8 @@ extern "C" {
 // Minor 1: added structured fields to RAYNEO_DeviceInfoMini (backward compatible: raw[] still first)
 // Minor 2: added RAYNEO_EVENT_NOTIFY (sleep/wake notifications) and notify union member
 // Minor 3: added Rayneo_SetTargetInterface and RAYNEO_NOTIFY_BUTTON_SPATIAL_MODE
-#define RAYNEO_API_VERSION_MINOR 3
+// Minor 4: added Rayneo_GetLastImuFrame for raw 64-byte IMU frame snapshots
+#define RAYNEO_API_VERSION_MINOR 4
 #define RAYNEO_API_VERSION ((RAYNEO_API_VERSION_MAJOR << 16) | (RAYNEO_API_VERSION_MINOR & 0xFFFF))
 
 RAYNEO_API unsigned int Rayneo_GetApiVersion(void); // returns packed version
@@ -181,6 +182,7 @@ RAYNEO_API RAYNEO_Result Rayneo_DisplaySet2D(RAYNEO_Context ctx);
 
 // Snapshots of last parsed data
 RAYNEO_API RAYNEO_Result Rayneo_GetLastImu(RAYNEO_Context ctx, RAYNEO_ImuSample* out);
+RAYNEO_API RAYNEO_Result Rayneo_GetLastImuFrame(RAYNEO_Context ctx, uint8_t outFrame[64]);
 RAYNEO_API RAYNEO_Result Rayneo_GetDeviceInfo(RAYNEO_Context ctx, RAYNEO_DeviceInfoMini* out);
 
 #ifdef __cplusplus

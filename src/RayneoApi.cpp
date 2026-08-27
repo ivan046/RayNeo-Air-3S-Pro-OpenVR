@@ -10,7 +10,6 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
-#include <cstdlib>
 #include <cstdarg>
 
 #ifdef __APPLE__
@@ -21,13 +20,6 @@
 #include <libusb.h>
 #endif
 
-#ifndef __APPLE__
-static const char *rayneoUsbErr(int code)
-{
-    return libusb_error_name(code);
-}
-#endif
-
 struct RayneoContext__
 {
     uint16_t vid{0};
@@ -36,15 +28,20 @@ struct RayneoContext__
     RAYNEO_EventCallback cb{nullptr};
     void *cbUser{nullptr};
     int logLevel{2};
-    uint64_t seq{0};
+    std::atomic<uint64_t> seq{0};
     // Simple last snapshots
+    std::mutex snapshotMtx;
     RAYNEO_ImuSample lastImu{};
     RAYNEO_DeviceInfoMini lastInfo{};
+    uint8_t lastImuFrame[64]{};
+    bool lastImuFrameValid{false};
     // Minimal event queue for PollEvent (single-producer single-consumer style)
     std::mutex qMtx;
     std::condition_variable qCv;
     std::vector<RAYNEO_Event> queue; // naive FIFO
     size_t maxQueue{128};
+    std::thread callbackWorker;
+    std::atomic<bool> stopCallback{false};
     // --- transport (non-Apple libusb) ---
 #ifndef __APPLE__
     libusb_context *usbCtx{nullptr};
@@ -79,11 +76,15 @@ struct RayneoContext__
     std::thread worker;
     std::atomic<bool> stopWorker{false};
     std::atomic<bool> stopIssued{false};
-    // RoundTrip sync
+    std::atomic<bool> detachEmitted{false};
+    // Outbound command serialization and RoundTrip sync
+    std::mutex commandMtx;
     std::mutex rtMtx;
     std::condition_variable rtCv;
-    uint8_t lastFrame[64]{}; // last raw frame
-    std::atomic<bool> haveNewFrame{false};
+    uint8_t rtFrame[64]{};
+    uint8_t rtCommand{0};
+    bool rtPending{false};
+    bool rtReady{false};
     std::atomic<uint8_t> lastType{0};
 };
 
@@ -159,6 +160,18 @@ static constexpr uint8_t RAYNEO_GT_NOTIFY_SPATIAL_MODE = 0x08;
 
 static void enqueueEvent(RayneoContext__ *ctx, const RAYNEO_Event &evt);
 
+static void emitDetachedOnce(RayneoContext__ *ctx)
+{
+    bool expected = false;
+    if (!ctx || !ctx->detachEmitted.compare_exchange_strong(expected, true))
+        return;
+
+    RAYNEO_Event evt{};
+    evt.type = RAYNEO_EVENT_DEVICE_DETACHED;
+    evt.seq = ++ctx->seq;
+    enqueueEvent(ctx, evt);
+}
+
 static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t len)
 {
     if (!ctx || !buf || len < 2)
@@ -170,12 +183,23 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
 
     uint8_t type = buf[1];
     ctx->lastType.store(type);
+
+    if (type == RAYNEO_PROTO_ACK_COMMAND)
     {
-        std::lock_guard<std::mutex> lk(ctx->rtMtx);
-        std::memcpy(ctx->lastFrame, buf, 64);
-        ctx->haveNewFrame.store(true);
+        bool matched = false;
+        {
+            std::lock_guard<std::mutex> lk(ctx->rtMtx);
+            if (ctx->rtPending && buf[8] == ctx->rtCommand)
+            {
+                std::memcpy(ctx->rtFrame, buf, 64);
+                ctx->rtReady = true;
+                ctx->rtPending = false;
+                matched = true;
+            }
+        }
+        if (matched)
+            ctx->rtCv.notify_all();
     }
-    ctx->rtCv.notify_all();
 
     auto rdF = [&](int off)
     {
@@ -212,7 +236,12 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
             sample.checksum = buf[57];
         for (int i = 0; i < 3; i++)
             sample.gyroRad[i] = sample.gyroDps[i] * 0.0174532925f;
-        ctx->lastImu = sample;
+        {
+            std::lock_guard<std::mutex> lk(ctx->snapshotMtx);
+            ctx->lastImu = sample;
+            std::memcpy(ctx->lastImuFrame, buf, 64);
+            ctx->lastImuFrameValid = true;
+        }
         RAYNEO_Event evt{};
         evt.type = RAYNEO_EVENT_IMU_SAMPLE;
         evt.seq = ++ctx->seq;
@@ -343,8 +372,8 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
                    value == kCmdVolumeSet) {
             return;
 
-        } else if (value != 0) {
-            printf("[SimpleClient] Unknown Notify? 0x%02X\n", value);
+        } else if (value != kCmdDeviceInfo) {
+            return;
         }
 
         if (need(12))
@@ -382,8 +411,12 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
         info.max_volume = rdBp();
         info.support_panel_color_adjust = rdBp();
         info.flag = rdBp();
-        bool emit = (!ctx->lastInfo.valid) || (ctx->lastInfo.tick != info.tick);
-        ctx->lastInfo = info;
+        bool emit = false;
+        {
+            std::lock_guard<std::mutex> lk(ctx->snapshotMtx);
+            emit = (!ctx->lastInfo.valid) || (ctx->lastInfo.tick != info.tick);
+            ctx->lastInfo = info;
+        }
         if (emit)
         {
             RAYNEO_Event evt{};
@@ -695,11 +728,6 @@ static void enqueueEvent(RayneoContext__ *ctx, const RAYNEO_Event &evt)
 {
     if (!ctx)
         return;
-    if (ctx->cb)
-    {
-        ctx->cb(&evt, ctx->cbUser);
-        return;
-    }
     std::unique_lock<std::mutex> lk(ctx->qMtx);
     if (ctx->queue.size() >= ctx->maxQueue)
     {
@@ -758,7 +786,8 @@ void Rayneo_Destroy(RAYNEO_Context ctx)
 {
     if (!ctx)
         return;
-    Rayneo_Stop(ctx); // ensure stopped
+    if (Rayneo_Stop(ctx) == RAYNEO_ERR_BUSY)
+        return;
     delete ctx;
 }
 
@@ -815,6 +844,26 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         return RAYNEO_ERR_BUSY;
     ctx->stopIssued.store(false);
     ctx->stopWorker.store(false);
+    ctx->stopCallback.store(false);
+    ctx->detachEmitted.store(false);
+    {
+        std::lock_guard<std::mutex> lk(ctx->snapshotMtx);
+        ctx->lastImu = {};
+        ctx->lastInfo = {};
+        std::memset(ctx->lastImuFrame, 0, sizeof(ctx->lastImuFrame));
+        ctx->lastImuFrameValid = false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->rtMtx);
+        ctx->rtPending = false;
+        ctx->rtReady = false;
+        ctx->rtCommand = 0;
+        std::memset(ctx->rtFrame, 0, sizeof(ctx->rtFrame));
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->qMtx);
+        ctx->queue.clear();
+    }
         // Initialize transport
 #ifndef __APPLE__
     if (libusb_init(&ctx->usbCtx) != 0)
@@ -824,6 +873,15 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
     }
     libusb_device **list = nullptr;
     ssize_t n = libusb_get_device_list(ctx->usbCtx, &list);
+    if (n < 0)
+    {
+        if (list)
+            libusb_free_device_list(list, 1);
+        libusb_exit(ctx->usbCtx);
+        ctx->usbCtx = nullptr;
+        ctx->running.store(false);
+        return RAYNEO_ERR_IO;
+    }
     libusb_device *target = nullptr;
     for (ssize_t i = 0; i < n; i++)
     {
@@ -842,12 +900,21 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
     {
         // target not found
         libusb_free_device_list(list, 1);
+        libusb_exit(ctx->usbCtx);
+        ctx->usbCtx = nullptr;
         ctx->running.store(false);
         return RAYNEO_ERR_NO_DEVICE;
     }
     if (libusb_open(target, &ctx->handle) != 0 || !ctx->handle)
     {
         libusb_free_device_list(list, 1);
+        if (ctx->handle)
+        {
+            libusb_close(ctx->handle);
+            ctx->handle = nullptr;
+        }
+        libusb_exit(ctx->usbCtx);
+        ctx->usbCtx = nullptr;
         ctx->running.store(false);
         return RAYNEO_ERR_IO;
     }
@@ -923,16 +990,43 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         }
         
         int cRc = libusb_claim_interface(ctx->handle, ctx->interfaceNumber);
-        if (cRc == 0 && ctx->altSetting >= 0)
+        if (cRc != 0)
         {
-            libusb_set_interface_alt_setting(ctx->handle, ctx->interfaceNumber, ctx->altSetting);
+            libusb_close(ctx->handle);
+            ctx->handle = nullptr;
+            libusb_exit(ctx->usbCtx);
+            ctx->usbCtx = nullptr;
+            ctx->running.store(false);
+            return (cRc == LIBUSB_ERROR_BUSY) ? RAYNEO_ERR_BUSY : RAYNEO_ERR_IO;
+        }
+        if (ctx->altSetting > 0)
+        {
+            int altRc = libusb_set_interface_alt_setting(ctx->handle, ctx->interfaceNumber, ctx->altSetting);
+            if (altRc != 0)
+            {
+                libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+                libusb_close(ctx->handle);
+                ctx->handle = nullptr;
+                libusb_exit(ctx->usbCtx);
+                ctx->usbCtx = nullptr;
+                ctx->running.store(false);
+                return RAYNEO_ERR_IO;
+            }
         }
     }
 #else
     ctx->macReady = false;
     ctx->macReadyStatus = RAYNEO_OK;
     ctx->macDeviceOnline.store(false);
-    ctx->worker = std::thread(macWorkerThread, ctx);
+    try
+    {
+        ctx->worker = std::thread(macWorkerThread, ctx);
+    }
+    catch (...)
+    {
+        ctx->running.store(false);
+        return RAYNEO_ERR_GENERAL;
+    }
     RAYNEO_Result startStatus = RAYNEO_OK;
     {
         std::unique_lock<std::mutex> lk(ctx->macReadyMtx);
@@ -957,13 +1051,6 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         return startStatus;
     }
 #endif
-    // Emit attached event
-    {
-        RAYNEO_Event evt{};
-        evt.type = RAYNEO_EVENT_DEVICE_ATTACHED;
-        evt.seq = ++ctx->seq;
-        enqueueEvent(ctx, evt);
-    }
     // Start worker thread (only if we have IN endpoint)
 #ifndef __APPLE__
     if (ctx->handle && ctx->epIn)
@@ -971,58 +1058,157 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         ctx->stopWorker.store(false);
         // Prepare async transfer
         ctx->inTransfer = libusb_alloc_transfer(0);
+        if (!ctx->inTransfer)
+        {
+            libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+            libusb_close(ctx->handle);
+            ctx->handle = nullptr;
+            libusb_exit(ctx->usbCtx);
+            ctx->usbCtx = nullptr;
+            ctx->running.store(false);
+            return RAYNEO_ERR_GENERAL;
+        }
         static auto transferCallback = [](libusb_transfer *tr)
         {
             auto *ctx = static_cast<RayneoContext__ *>(tr->user_data);
             if (!ctx)
                 return;
-            if (ctx->stopWorker.load())
+
+            uint8_t frame[64]{};
+            bool haveFrame = false;
+
+            if (tr->status == LIBUSB_TRANSFER_COMPLETED && tr->actual_length >= 64)
             {
+                std::memcpy(frame, tr->buffer, 64);
+                haveFrame = true;
+            }
+            else if (tr->status == LIBUSB_TRANSFER_NO_DEVICE)
+            {
+                ctx->transferResubmit.store(false);
+                ctx->stopWorker.store(true);
                 ctx->transferDone.store(true);
+                emitDetachedOnce(ctx);
                 return;
             }
-            
-            if (tr->status == LIBUSB_TRANSFER_COMPLETED)
-            {
-                if (tr->actual_length >= 2)
-                {
-                    // Show first bytes even if <64 to debug filtering
-                    
-                }
-                if (tr->actual_length >= 64)
-                {
-                    processInboundFrame(ctx, tr->buffer, static_cast<size_t>(tr->actual_length));
-                }
-            }
+
             ctx->transferDone.store(true);
             if (!ctx->stopWorker.load() && ctx->transferResubmit.load())
             {
                 ctx->transferDone.store(false);
                 int r = libusb_submit_transfer(tr);
-                
+                if (r != 0)
+                {
+                    ctx->transferDone.store(true);
+                    ctx->transferResubmit.store(false);
+                    ctx->stopWorker.store(true);
+                    RAYNEO_Event evt{};
+                    evt.type = RAYNEO_EVENT_ERROR;
+                    evt.seq = ++ctx->seq;
+                    evt.data.error.code = r;
+                    enqueueEvent(ctx, evt);
+                }
             }
+
+            if (haveFrame)
+                processInboundFrame(ctx, frame, sizeof(frame));
         };
         size_t inSize = ctx->epInMaxPacket ? ctx->epInMaxPacket : 64;
-        if (inSize < 64) inSize = 64;
+        if (inSize < 64)
+            inSize = 64;
         ctx->inBuffer.assign(inSize, 0);
         libusb_fill_interrupt_transfer(ctx->inTransfer, ctx->handle, ctx->epIn,
                                        ctx->inBuffer.data(), (int)inSize,
                                        transferCallback, ctx, 0);
-        ctx->transferActive.store(true);
+        ctx->transferActive.store(false);
+        ctx->transferDone.store(true);
+        ctx->transferResubmit.store(false);
+        try
+        {
+            ctx->worker = std::thread([ctx]()
+            {
+                while (!ctx->stopWorker.load() || !ctx->transferDone.load())
+                {
+                    timeval tv{0, 100000}; // 100ms
+                    libusb_handle_events_timeout_completed(ctx->usbCtx, &tv, nullptr);
+                }
+            });
+        }
+        catch (...)
+        {
+            libusb_free_transfer(ctx->inTransfer);
+            ctx->inTransfer = nullptr;
+            libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+            libusb_close(ctx->handle);
+            ctx->handle = nullptr;
+            libusb_exit(ctx->usbCtx);
+            ctx->usbCtx = nullptr;
+            ctx->running.store(false);
+            return RAYNEO_ERR_GENERAL;
+        }
+
         ctx->transferDone.store(false);
         ctx->transferResubmit.store(true);
         int submitRc = libusb_submit_transfer(ctx->inTransfer);
-        (void)submitRc;
-        ctx->worker = std::thread([ctx]() 
+        if (submitRc != 0)
         {
-            while (!ctx->stopWorker.load())
-            {
-                timeval tv{0, 100000}; // 100ms
-                libusb_handle_events_timeout_completed(ctx->usbCtx, &tv, nullptr);
-            }
-        });
+            ctx->transferDone.store(true);
+            ctx->transferResubmit.store(false);
+            ctx->stopWorker.store(true);
+            if (ctx->worker.joinable())
+                ctx->worker.join();
+            libusb_free_transfer(ctx->inTransfer);
+            ctx->inTransfer = nullptr;
+            libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+            libusb_close(ctx->handle);
+            ctx->handle = nullptr;
+            libusb_exit(ctx->usbCtx);
+            ctx->usbCtx = nullptr;
+            ctx->running.store(false);
+            return RAYNEO_ERR_IO;
+        }
+        ctx->transferActive.store(true);
     }
 #endif
+
+    if (ctx->cb)
+    {
+        try
+        {
+            ctx->callbackWorker = std::thread([ctx]()
+            {
+                for (;;)
+                {
+                    RAYNEO_Event evt{};
+                    {
+                        std::unique_lock<std::mutex> lk(ctx->qMtx);
+                        ctx->qCv.wait(lk, [&]
+                                      { return ctx->stopCallback.load() || !ctx->queue.empty(); });
+                        if (ctx->queue.empty())
+                        {
+                            if (ctx->stopCallback.load())
+                                return;
+                            continue;
+                        }
+                        evt = ctx->queue.front();
+                        ctx->queue.erase(ctx->queue.begin());
+                    }
+                    ctx->cb(&evt, ctx->cbUser);
+                }
+            });
+        }
+        catch (...)
+        {
+            Rayneo_Stop(ctx);
+            return RAYNEO_ERR_GENERAL;
+        }
+    }
+
+    {
+        RAYNEO_Event evt{};
+        evt.type = RAYNEO_EVENT_DEVICE_ATTACHED;
+        evt.seq = ++ctx->seq;
+        enqueueEvent(ctx, evt);
+    }
     return RAYNEO_OK;
 }
 
@@ -1031,27 +1217,26 @@ RAYNEO_Result Rayneo_Stop(RAYNEO_Context ctx)
     if (!ctx)
         return RAYNEO_ERR_INVALID_ARG;
 
-    // Prevent deadlock if Rayneo_Stop is called from the event callback (which runs on the worker thread)
-    if (ctx->worker.joinable() && std::this_thread::get_id() == ctx->worker.get_id())
+    // Stop must not join either SDK worker from inside that same worker.
+    const auto self = std::this_thread::get_id();
+    if ((ctx->worker.joinable() && self == ctx->worker.get_id()) ||
+        (ctx->callbackWorker.joinable() && self == ctx->callbackWorker.get_id()))
     {
-        ctx->stopIssued.store(true);
-        ctx->running.store(false);
-        ctx->stopWorker.store(true);
-        // We cannot join() ourselves. The worker will exit its loop eventually since stopWorker is true,
-        // but we can't safely clean up resources here that the worker might still be using.
         return RAYNEO_ERR_BUSY;
     }
 
     if (ctx->stopIssued.exchange(true))
         return RAYNEO_OK;
     bool was = ctx->running.exchange(false);
-    const bool debug = (std::getenv("RAYNEO_DEBUG_SHUTDOWN") != nullptr);
+    ctx->rtCv.notify_all();
+    std::unique_lock<std::mutex> commandLock(ctx->commandMtx);
     if (was)
     {
         ctx->stopWorker.store(true);
 #ifndef __APPLE__
+        ctx->transferResubmit.store(false);
         // Cancel pending transfer to ensure worker loop wakes up immediately
-        if (ctx->inTransfer && ctx->transferActive.load())
+        if (ctx->inTransfer && ctx->transferActive.load() && !ctx->transferDone.load())
         {
             libusb_cancel_transfer(ctx->inTransfer);
         }
@@ -1086,10 +1271,19 @@ RAYNEO_Result Rayneo_Stop(RAYNEO_Context ctx)
         macReleaseDevice(ctx);
         macCleanupManager(ctx);
 #endif
-        RAYNEO_Event evt{};
-        evt.type = RAYNEO_EVENT_DEVICE_DETACHED;
-        evt.seq = ++ctx->seq;
-        enqueueEvent(ctx, evt);
+        commandLock.unlock();
+        emitDetachedOnce(ctx);
+    }
+    else
+    {
+        commandLock.unlock();
+    }
+
+    if (ctx->callbackWorker.joinable())
+    {
+        ctx->stopCallback.store(true);
+        ctx->qCv.notify_all();
+        ctx->callbackWorker.join();
     }
     return RAYNEO_OK;
 }
@@ -1098,6 +1292,8 @@ RAYNEO_Result Rayneo_PollEvent(RAYNEO_Context ctx, RAYNEO_Event *outEvent, uint3
 {
     if (!ctx || !outEvent)
         return RAYNEO_ERR_INVALID_ARG;
+    if (ctx->cb)
+        return RAYNEO_ERR_BUSY;
     std::unique_lock<std::mutex> lk(ctx->qMtx);
     ctx->qCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&]{ return !ctx->queue.empty(); });
     if (ctx->queue.empty())
@@ -1107,7 +1303,7 @@ RAYNEO_Result Rayneo_PollEvent(RAYNEO_Context ctx, RAYNEO_Event *outEvent, uint3
     return RAYNEO_OK;
 }
 
-RAYNEO_Result Rayneo_SendRaw(RAYNEO_Context ctx, const uint8_t frame[64])
+static RAYNEO_Result sendRawTransport(RAYNEO_Context ctx, const uint8_t frame[64])
 {
     if (!ctx || !frame)
         return RAYNEO_ERR_INVALID_ARG;
@@ -1123,7 +1319,7 @@ RAYNEO_Result Rayneo_SendRaw(RAYNEO_Context ctx, const uint8_t frame[64])
     {
         rc = libusb_interrupt_transfer(ctx->handle, ctx->epOut, const_cast<uint8_t *>(frame), 64, &transferred, 500);
         
-        if (rc == 0 && transferred == 64)
+        if (rc == 0 && transferred >= 64)
             return RAYNEO_OK;
     }
     // Fallback control: SET_REPORT Output report ID 0
@@ -1149,6 +1345,14 @@ RAYNEO_Result Rayneo_SendRaw(RAYNEO_Context ctx, const uint8_t frame[64])
     CFRelease(dev);
     return (rc == kIOReturnSuccess) ? RAYNEO_OK : RAYNEO_ERR_IO;
 #endif
+}
+
+RAYNEO_Result Rayneo_SendRaw(RAYNEO_Context ctx, const uint8_t frame[64])
+{
+    if (!ctx || !frame)
+        return RAYNEO_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(ctx->commandMtx);
+    return sendRawTransport(ctx, frame);
 }
 
 static void buildFrame(uint8_t command, uint8_t value, const void *payload, size_t payloadLen, uint8_t out[64])
@@ -1178,18 +1382,45 @@ RAYNEO_Result Rayneo_RoundTrip(RAYNEO_Context ctx, uint8_t command, uint8_t valu
 {
     if (!ctx || !outFrame)
         return RAYNEO_ERR_INVALID_ARG;
+
+    std::unique_lock<std::mutex> commandLock(ctx->commandMtx);
+
     uint8_t frame[64];
     buildFrame(command, value, payload, payloadLen, frame);
-    // Reset flag before send
-    ctx->haveNewFrame.store(false);
-    auto rc = Rayneo_SendRaw(ctx, frame);
+
+    {
+        std::lock_guard<std::mutex> lk(ctx->rtMtx);
+        ctx->rtCommand = command;
+        ctx->rtPending = true;
+        ctx->rtReady = false;
+    }
+
+    auto rc = sendRawTransport(ctx, frame);
     if (rc != RAYNEO_OK)
+    {
+        std::lock_guard<std::mutex> lk(ctx->rtMtx);
+        ctx->rtPending = false;
+        ctx->rtReady = false;
         return rc;
+    }
+
     std::unique_lock<std::mutex> lk(ctx->rtMtx);
-    if (!ctx->rtCv.wait_for(lk, std::chrono::milliseconds(timeoutMs == 0 ? 500 : timeoutMs), [&]
-                            { return ctx->haveNewFrame.load(); }))
+    const auto waitTime = std::chrono::milliseconds(timeoutMs == 0 ? 500 : timeoutMs);
+    if (!ctx->rtCv.wait_for(lk, waitTime, [&]
+                            { return ctx->rtReady || !ctx->running.load(); }))
+    {
+        ctx->rtPending = false;
+        ctx->rtReady = false;
         return RAYNEO_ERR_TIMEOUT;
-    std::memcpy(outFrame, ctx->lastFrame, 64);
+    }
+    if (!ctx->rtReady)
+    {
+        ctx->rtPending = false;
+        return RAYNEO_ERR_NO_DEVICE;
+    }
+
+    std::memcpy(outFrame, ctx->rtFrame, 64);
+    ctx->rtReady = false;
     return RAYNEO_OK;
 }
 
@@ -1230,13 +1461,28 @@ RAYNEO_Result Rayneo_GetLastImu(RAYNEO_Context ctx, RAYNEO_ImuSample *out)
 {
     if (!ctx || !out)
         return RAYNEO_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(ctx->snapshotMtx);
     *out = ctx->lastImu;
     return out->valid ? RAYNEO_OK : RAYNEO_ERR_TIMEOUT;
 }
+
+RAYNEO_Result Rayneo_GetLastImuFrame(RAYNEO_Context ctx, uint8_t outFrame[64])
+{
+    if (!ctx || !outFrame)
+        return RAYNEO_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(ctx->snapshotMtx);
+    if (!ctx->lastImuFrameValid)
+        return RAYNEO_ERR_TIMEOUT;
+    std::memcpy(outFrame, ctx->lastImuFrame, 64);
+    return RAYNEO_OK;
+}
+
 RAYNEO_Result Rayneo_GetDeviceInfo(RAYNEO_Context ctx, RAYNEO_DeviceInfoMini *out)
 {
     if (!ctx || !out)
         return RAYNEO_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(ctx->snapshotMtx);
     *out = ctx->lastInfo;
     return out->valid ? RAYNEO_OK : RAYNEO_ERR_TIMEOUT;
 }
+
