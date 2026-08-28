@@ -1,0 +1,36 @@
+# RayNeoSDK Windows x64 build kit (xwin / clang-cl)
+
+Build from the repository root:
+
+```bash
+SDK_VERSION=1.4 ./docker/build.sh
+```
+
+Toolchain:
+
+- base image: `messense/cargo-xwin:0.22.0`
+- target: `x86_64-pc-windows-msvc`
+- compiler/linker: `clang-cl` + `lld-link`
+- MSVC family: Visual Studio 2022 17.14 / v143 14.44
+- Windows SDK family: 10.0.26100
+- CRT package: 14.44.17.14
+- CRT linkage: dynamic (`/MD` / `MultiThreadedDLL`)
+- libusb: official `libusb-1.0.30.7z`, `VS2022/MS64/dll`
+
+The SDK source and its CMake files are not patched by this kit. The existing
+`LIBUSB_INCLUDE_DIR` and `LIBUSB_LIBRARY` inputs are used directly.
+
+Output:
+
+```text
+dist/RayNeoSDK-${SDK_VERSION}-win64-msvc/
+├── include/
+│   └── rayneo_api.h
+├── bin/
+│   ├── RayNeoSDK.dll
+│   └── libusb-1.0.dll
+└── lib/
+    └── RayNeoSDK.lib
+
+dist/RayNeoSDK-${SDK_VERSION}-win64-msvc.tar.gz
+```
