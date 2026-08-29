@@ -35,7 +35,7 @@ struct RayneoContext__
     RAYNEO_DeviceInfoMini lastInfo{};
     uint8_t lastImuFrame[64]{};
     bool lastImuFrameValid{false};
-    // Minimal event queue for PollEvent (single-producer single-consumer style)
+    // Event queue shared by transport/event producers and one consumer.
     std::mutex qMtx;
     std::condition_variable qCv;
     std::vector<RAYNEO_Event> queue; // naive FIFO
@@ -367,11 +367,6 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
             enqueueEvent(ctx, evt);
             return;
 
-        } else if (value == kCmdDisplay3dMode ||
-                   value == kCmdDisplay2dMode ||
-                   value == kCmdVolumeSet) {
-            return;
-
         } else if (value != kCmdDeviceInfo) {
             return;
         }
@@ -502,12 +497,7 @@ static void macDeviceRemovalCallback(void *context, IOReturn result, void *, IOH
         }
     }
     if (emitDetach && !ctx->stopWorker.load())
-    {
-        RAYNEO_Event evt{};
-        evt.type = RAYNEO_EVENT_DEVICE_DETACHED;
-        evt.seq = ++ctx->seq;
-        enqueueEvent(ctx, evt);
-    }
+        emitDetachedOnce(ctx);
 }
 
 static void macInputReportCallback(void *context, IOReturn result, void *, IOHIDReportType, uint32_t, uint8_t *report, CFIndex reportLength)
@@ -786,6 +776,17 @@ void Rayneo_Destroy(RAYNEO_Context ctx)
 {
     if (!ctx)
         return;
+
+    // callbackWorker owns the callback's stack. It cannot destroy the context
+    // that owns that std::thread before the callback returns. Stop is safe
+    // here; the owning thread performs the actual destruction afterwards.
+    if (ctx->callbackWorker.joinable() &&
+        std::this_thread::get_id() == ctx->callbackWorker.get_id())
+    {
+        (void)Rayneo_Stop(ctx);
+        return;
+    }
+
     if (Rayneo_Stop(ctx) == RAYNEO_ERR_BUSY)
         return;
     delete ctx;
@@ -824,6 +825,18 @@ RAYNEO_Result Rayneo_SetEventCallback(RAYNEO_Context ctx, RAYNEO_EventCallback c
         return RAYNEO_ERR_INVALID_ARG;
     if (ctx->running.load())
         return RAYNEO_ERR_BUSY;
+
+    // Stop called from the callback cannot join its own dispatcher. Reap it
+    // before replacing callback state for the next session.
+    if (ctx->callbackWorker.joinable())
+    {
+        if (std::this_thread::get_id() == ctx->callbackWorker.get_id())
+            return RAYNEO_ERR_BUSY;
+        ctx->stopCallback.store(true);
+        ctx->qCv.notify_all();
+        ctx->callbackWorker.join();
+    }
+
     ctx->cb = cb;
     ctx->cbUser = user;
     return RAYNEO_OK;
@@ -839,6 +852,20 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
 {
     if (!ctx)
         return RAYNEO_ERR_INVALID_ARG;
+    if (ctx->running.load())
+        return RAYNEO_ERR_BUSY;
+
+    // Stop called from the callback cannot join its own dispatcher. Reap it
+    // before starting the next session.
+    if (ctx->callbackWorker.joinable())
+    {
+        if (std::this_thread::get_id() == ctx->callbackWorker.get_id())
+            return RAYNEO_ERR_BUSY;
+        ctx->stopCallback.store(true);
+        ctx->qCv.notify_all();
+        ctx->callbackWorker.join();
+    }
+
     bool expected = false;
     if (!ctx->running.compare_exchange_strong(expected, true))
         return RAYNEO_ERR_BUSY;
@@ -864,7 +891,13 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         std::lock_guard<std::mutex> lk(ctx->qMtx);
         ctx->queue.clear();
     }
-        // Initialize transport
+
+    // Reserve the first sequence number before transport threads can publish
+    // data. The attached event is inserted at the front after initialization
+    // succeeds, preserving DEVICE_ATTACHED -> data ordering.
+    const uint64_t attachedSeq = ++ctx->seq;
+
+    // Initialize transport
 #ifndef __APPLE__
     if (libusb_init(&ctx->usbCtx) != 0)
     {
@@ -1170,11 +1203,25 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
     }
 #endif
 
+    {
+        RAYNEO_Event evt{};
+        evt.type = RAYNEO_EVENT_DEVICE_ATTACHED;
+        evt.seq = attachedSeq;
+
+        std::lock_guard<std::mutex> lk(ctx->qMtx);
+        if (ctx->queue.size() >= ctx->maxQueue)
+            ctx->queue.pop_back();
+        ctx->queue.insert(ctx->queue.begin(), evt);
+    }
+    ctx->qCv.notify_one();
+
     if (ctx->cb)
     {
+        const auto callback = ctx->cb;
+        void *const callbackUser = ctx->cbUser;
         try
         {
-            ctx->callbackWorker = std::thread([ctx]()
+            ctx->callbackWorker = std::thread([ctx, callback, callbackUser]()
             {
                 for (;;)
                 {
@@ -1192,7 +1239,7 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
                         evt = ctx->queue.front();
                         ctx->queue.erase(ctx->queue.begin());
                     }
-                    ctx->cb(&evt, ctx->cbUser);
+                    callback(&evt, callbackUser);
                 }
             });
         }
@@ -1203,12 +1250,6 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         }
     }
 
-    {
-        RAYNEO_Event evt{};
-        evt.type = RAYNEO_EVENT_DEVICE_ATTACHED;
-        evt.seq = ++ctx->seq;
-        enqueueEvent(ctx, evt);
-    }
     return RAYNEO_OK;
 }
 
@@ -1217,74 +1258,79 @@ RAYNEO_Result Rayneo_Stop(RAYNEO_Context ctx)
     if (!ctx)
         return RAYNEO_ERR_INVALID_ARG;
 
-    // Stop must not join either SDK worker from inside that same worker.
     const auto self = std::this_thread::get_id();
-    if ((ctx->worker.joinable() && self == ctx->worker.get_id()) ||
-        (ctx->callbackWorker.joinable() && self == ctx->callbackWorker.get_id()))
-    {
-        return RAYNEO_ERR_BUSY;
-    }
+    const bool fromTransportWorker =
+        ctx->worker.joinable() && self == ctx->worker.get_id();
+    const bool fromCallback =
+        ctx->callbackWorker.joinable() && self == ctx->callbackWorker.get_id();
 
-    if (ctx->stopIssued.exchange(true))
-        return RAYNEO_OK;
-    bool was = ctx->running.exchange(false);
-    ctx->rtCv.notify_all();
-    std::unique_lock<std::mutex> commandLock(ctx->commandMtx);
-    if (was)
+    // Transport cleanup cannot join the transport worker from itself.
+    if (fromTransportWorker)
+        return RAYNEO_ERR_BUSY;
+
+    const bool firstStop = !ctx->stopIssued.exchange(true);
+    if (firstStop)
     {
-        ctx->stopWorker.store(true);
-#ifndef __APPLE__
-        ctx->transferResubmit.store(false);
-        // Cancel pending transfer to ensure worker loop wakes up immediately
-        if (ctx->inTransfer && ctx->transferActive.load() && !ctx->transferDone.load())
+        const bool was = ctx->running.exchange(false);
+        ctx->rtCv.notify_all();
+        std::unique_lock<std::mutex> commandLock(ctx->commandMtx);
+        if (was)
         {
-            libusb_cancel_transfer(ctx->inTransfer);
-        }
+            ctx->stopWorker.store(true);
+#ifndef __APPLE__
+            ctx->transferResubmit.store(false);
+            if (ctx->inTransfer && ctx->transferActive.load() && !ctx->transferDone.load())
+                libusb_cancel_transfer(ctx->inTransfer);
 #endif
 #ifdef __APPLE__
-        if (ctx->hidRunLoop)
-            CFRunLoopWakeUp(ctx->hidRunLoop);
+            if (ctx->hidRunLoop)
+                CFRunLoopWakeUp(ctx->hidRunLoop);
 #endif
-        if (ctx->worker.joinable())
-            ctx->worker.join();
+            if (ctx->worker.joinable())
+                ctx->worker.join();
 #ifndef __APPLE__
-        if (ctx->inTransfer)
-        {
-            libusb_free_transfer(ctx->inTransfer);
-            ctx->inTransfer = nullptr;
-        }
-        if (ctx->handle && ctx->interfaceNumber >= 0)
-            libusb_release_interface(ctx->handle, ctx->interfaceNumber);
-        if (ctx->handle)
-        {
-            libusb_close(ctx->handle);
-            ctx->handle = nullptr;
-        }
-        if (ctx->usbCtx)
-        {
-            libusb_exit(ctx->usbCtx);
-            ctx->usbCtx = nullptr;
-        }
+            if (ctx->inTransfer)
+            {
+                libusb_free_transfer(ctx->inTransfer);
+                ctx->inTransfer = nullptr;
+            }
+            if (ctx->handle && ctx->interfaceNumber >= 0)
+                libusb_release_interface(ctx->handle, ctx->interfaceNumber);
+            if (ctx->handle)
+            {
+                libusb_close(ctx->handle);
+                ctx->handle = nullptr;
+            }
+            if (ctx->usbCtx)
+            {
+                libusb_exit(ctx->usbCtx);
+                ctx->usbCtx = nullptr;
+            }
 #else
-        ctx->macReadyStatus = RAYNEO_OK;
-        ctx->macDeviceOnline.store(false);
-        macReleaseDevice(ctx);
-        macCleanupManager(ctx);
+            ctx->macReadyStatus = RAYNEO_OK;
+            ctx->macDeviceOnline.store(false);
+            macReleaseDevice(ctx);
+            macCleanupManager(ctx);
 #endif
-        commandLock.unlock();
-        emitDetachedOnce(ctx);
-    }
-    else
-    {
-        commandLock.unlock();
+            commandLock.unlock();
+            emitDetachedOnce(ctx);
+        }
+        else
+        {
+            commandLock.unlock();
+        }
     }
 
+    // Stop from the callback cannot join itself. The owning thread reaps the
+    // finished dispatcher on a later Stop, Start, SetEventCallback or Destroy.
     if (ctx->callbackWorker.joinable())
     {
         ctx->stopCallback.store(true);
         ctx->qCv.notify_all();
-        ctx->callbackWorker.join();
+        if (!fromCallback)
+            ctx->callbackWorker.join();
     }
+
     return RAYNEO_OK;
 }
 
