@@ -145,18 +145,25 @@ typedef void (*RAYNEO_EventCallback)(const RAYNEO_Event* evt, void* user);
 RAYNEO_API const char* Rayneo_ResultToString(RAYNEO_Result r);
 
 // Lifecycle
+// Lifecycle operations must not be invoked concurrently from multiple threads.
 RAYNEO_API RAYNEO_Result Rayneo_Create(RAYNEO_Context* outCtx);
+// Do not call Destroy from an SDK event callback. Call Stop from the callback,
+// return from it, then destroy the context from its owning thread.
 RAYNEO_API void          Rayneo_Destroy(RAYNEO_Context ctx);
 
 // Configuration (call before Start). If unset, defaults may be used.
 RAYNEO_API RAYNEO_Result Rayneo_SetTargetVidPid(RAYNEO_Context ctx, uint16_t vid, uint16_t pid);
 // Select a USB interface on libusb platforms. -1 keeps automatic selection.
 RAYNEO_API RAYNEO_Result Rayneo_SetTargetInterface(RAYNEO_Context ctx, int interfaceNumber);
+// Callback and PollEvent are alternative event-delivery modes. PollEvent
+// returns RAYNEO_ERR_BUSY while a callback is configured. Event delivery is
+// best-effort under sustained consumer backlog; consumers must tolerate drops.
 RAYNEO_API RAYNEO_Result Rayneo_SetEventCallback(RAYNEO_Context ctx, RAYNEO_EventCallback cb, void* user);
 RAYNEO_API RAYNEO_Result Rayneo_SetLogLevel(int level); // global/simple; 0=errors .. 3=debug
 
 // Service control
 RAYNEO_API RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t serviceFlags);
+// May be called from an SDK event callback.
 RAYNEO_API RAYNEO_Result Rayneo_Stop(RAYNEO_Context ctx);
 
 // Optional polling (alternative to callback). timeoutMs=0 => non-blocking.

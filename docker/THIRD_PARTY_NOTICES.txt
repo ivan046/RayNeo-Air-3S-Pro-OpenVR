@@ -1,0 +1,10 @@
+RayNeoSDK Windows package includes libusb 1.0.30 as a separate shared library
+(libusb source project: https://github.com/libusb/libusb).
+
+Copyright © libusb contributors.
+
+libusb is licensed under the GNU Lesser General Public License, version 2.1 or
+later. The package uses libusb through the shared library mechanism; the
+libusb DLL can be replaced with an interface-compatible build.
+
+The LGPL 2.1 license text is included as LICENSE-libusb.txt.
