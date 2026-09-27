@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.10)
+project(RayNeoGtProbe CXX)
+
+add_executable(RayNeoGtProbe main.cpp)
+if (TARGET RayNeoSDK)
+    target_link_libraries(RayNeoGtProbe PRIVATE RayNeoSDK)
+else()
+    message(FATAL_ERROR "RayNeoSDK target not found. Add this directory from the main build.")
+endif()
+target_include_directories(RayNeoGtProbe PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_features(RayNeoGtProbe PRIVATE cxx_std_17)
+rayneo_deploy_runtime(RayNeoGtProbe)
+
+if (APPLE)
+    set_target_properties(RayNeoGtProbe PROPERTIES BUILD_RPATH "@loader_path" INSTALL_RPATH "@loader_path")
+else()
+    set_target_properties(RayNeoGtProbe PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endif()

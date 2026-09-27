@@ -90,6 +90,7 @@ jobs:
           cmake --build build --config ${{ matrix.build_type }} --target RayNeoSDK
           cmake --build build --config ${{ matrix.build_type }} --target RayNeoExample || true
           cmake --build build --config ${{ matrix.build_type }} --target RayNeoOrientationDemo || true
+          cmake --build build --config ${{ matrix.build_type }} --target RayNeoGtProbe || true
           cmake --build build --config ${{ matrix.build_type }} --target openvr_stub_driver || true
         shell: pwsh
 
@@ -99,12 +100,15 @@ jobs:
           cmake --build build --target RayNeoSDK --config ${{ matrix.build_type }}
           cmake --build build --target RayNeoExample --config ${{ matrix.build_type }} || true
           cmake --build build --target RayNeoOrientationDemo --config ${{ matrix.build_type }} || true
+          cmake --build build --target RayNeoGtProbe --config ${{ matrix.build_type }} || true
           cmake --build build --target openvr_stub_driver --config ${{ matrix.build_type }} || true
         shell: bash
 
       - name: Package artifacts
         run: |
-          mkdir -p package/include package/bin package/examples
+          mkdir -p package/include package/bin package/examples package/licenses
+          cp THIRD_PARTY_NOTICES.md package/ || echo "Missing THIRD_PARTY_NOTICES.md"
+          cp thirdparties/vqf/LICENSE-MIT.txt package/licenses/VQF-LICENSE-MIT.txt || echo "Missing VQF license"
           if [ -d include ]; then
             cp -R include/. package/include/
           else
@@ -181,9 +185,11 @@ jobs:
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
             cp build/examples/simple/${{ matrix.build_type }}/* package/examples/ 2>/dev/null || true
             cp build/examples/orientation_demo/${{ matrix.build_type }}/* package/examples/ 2>/dev/null || true
+            cp build/examples/gt_probe/${{ matrix.build_type }}/* package/examples/ 2>/dev/null || true
           else
             cp build/examples/simple/* package/examples/ 2>/dev/null || true
             cp build/examples/orientation_demo/* package/examples/ 2>/dev/null || true
+            cp build/examples/gt_probe/* package/examples/ 2>/dev/null || true
           fi
           tar -czf rayneo-sdk-${{ matrix.os }}.tar.gz package
         shell: bash

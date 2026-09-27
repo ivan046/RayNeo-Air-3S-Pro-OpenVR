@@ -1,10 +1,12 @@
 #define RAYNEO_BUILD
 #include "rayneo_api.h"
+#include "vqf.hpp"
 
 #include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
+#include <deque>
 #include <string>
 #include <condition_variable>
 #include <chrono>
@@ -12,6 +14,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstdarg>
+#include <algorithm>
+#include <cmath>
+#include <memory>
 
 #ifdef __APPLE__
 #include <IOKit/hid/IOHIDManager.h>
@@ -93,6 +98,37 @@ struct RayneoContext__
     uint8_t rtCommand{0};
     bool rtPending{false};
     bool rtReady{false};
+
+    // GT 0x3E returns multiple frames; collect them without changing RoundTrip semantics.
+    std::mutex gtBiasMtx;
+    std::condition_variable gtBiasCv;
+    RAYNEO_GtGyroBiasTable gtBiasCollectTable{};
+    bool gtBiasCollecting{false};
+
+    // GT orientations use a separate queue to preserve the RAYNEO_Event ABI.
+    std::mutex gtOrientationMtx;
+    std::condition_variable gtOrientationCv;
+    std::deque<RAYNEO_GtOrientation> gtOrientationQueue;
+    size_t maxGtOrientationQueue{128};
+    RAYNEO_GtOrientation lastGtOrientation{};
+
+    std::mutex trackingMtx;
+    RAYNEO_GtTrackingConfig trackingConfig{};
+    RAYNEO_GtFactoryCalibration trackingCalibration{};
+    RAYNEO_GtGyroBiasTable trackingBiasTable{};
+    RAYNEO_GtMagCalibration trackingMagCalibration{{0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f}, 0, {0, 0, 0}};
+    std::unique_ptr<VQF> vqf;
+    std::atomic<bool> trackingActive{false};
+    bool trackingInitialized{false};
+    bool trackingFactoryFromDevice{false};
+    bool trackingBiasFromDevice{false};
+    bool trackingHaveTick{false};
+    bool trackingHaveMagTick{false};
+    bool trackingEverFedMag{false};
+    uint32_t trackingLastTick{0};
+    uint32_t trackingLastMagTick{0};
+    uint64_t trackingTimestampNs{0};
+
     std::atomic<uint8_t> lastType{0};
 };
 
@@ -163,8 +199,14 @@ enum FXRUsbCommand {
 };
 
 static constexpr uint8_t RAYNEO_GT_NOTIFY_SPATIAL_MODE = 0x08;
+static constexpr float RAYNEO_GT_VQF_IMU_HZ = 500.0f;
+static constexpr float RAYNEO_GT_VQF_MAG_HZ = 100.0f;
+static constexpr uint32_t RAYNEO_GT_FUSION_MAX_GAP_MS = 250u;
 
 static void enqueueEvent(RayneoContext__ *ctx, const RAYNEO_Event &evt);
+static void processGtOrientation(RayneoContext__ *ctx, const RAYNEO_ImuSample &sample);
+static bool rebuildGtFusionLocked(RayneoContext__ *ctx);
+static bool decodeGtGyroBiasFrame(const uint8_t frame[64], RAYNEO_GtGyroBiasTable &table);
 
 static void emitDetachedOnce(RayneoContext__ *ctx)
 {
@@ -236,10 +278,20 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
         sample.psensor = rdF(44);
         sample.lsensor = rdF(48);
         sample.magnet[2] = rdF(52);
-        if (len > 56)
-            sample.flag = buf[56];
-        if (len > 57)
-            sample.checksum = buf[57];
+        if (ctx->vid == RAYNEO_GT_VID && ctx->pid == RAYNEO_GT_PID)
+        {
+            // GT/Gemini 0x65 trailer: count[56..59], checksum[62], flag[63].
+            sample.count = rdU32(56);
+            sample.checksum = buf[62];
+            sample.flag = buf[63];
+        }
+        else
+        {
+            if (len > 56)
+                sample.flag = buf[56];
+            if (len > 57)
+                sample.checksum = buf[57];
+        }
         for (int i = 0; i < 3; i++)
             sample.gyroRad[i] = sample.gyroDps[i] * 0.0174532925f;
         {
@@ -253,9 +305,31 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
         evt.seq = ++ctx->seq;
         evt.data.imu = sample;
         enqueueEvent(ctx, evt);
+
+        processGtOrientation(ctx, sample);
     }
     else if (type == RAYNEO_PROTO_ACK_COMMAND)
     {
+        if (ctx->vid == RAYNEO_GT_VID && ctx->pid == RAYNEO_GT_PID &&
+            buf[8] == kCmdGetGyroBias)
+        {
+            bool notify = false;
+            {
+                std::lock_guard<std::mutex> lk(ctx->gtBiasMtx);
+                if (ctx->gtBiasCollecting && decodeGtGyroBiasFrame(buf, ctx->gtBiasCollectTable))
+                    notify = ctx->gtBiasCollectTable.complete != 0;
+            }
+            if (notify)
+                ctx->gtBiasCv.notify_all();
+            return;
+        }
+        if (ctx->vid == RAYNEO_GT_VID && ctx->pid == RAYNEO_GT_PID &&
+            (buf[8] == kCmdImuCalibration || buf[8] == kCmdSetGyroBias))
+        {
+            // GT calibration replies are not device-info or button notifications.
+            return;
+        }
+
         RAYNEO_DeviceInfoMini info{};
         info.valid = 1;
         if (len >= 64)
@@ -975,6 +1049,25 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         std::lock_guard<std::mutex> lk(ctx->qMtx);
         ctx->queue.clear();
     }
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        ctx->gtOrientationQueue.clear();
+        ctx->lastGtOrientation = {};
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtBiasMtx);
+        ctx->gtBiasCollecting = false;
+        ctx->gtBiasCollectTable = {};
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        ctx->trackingInitialized = false;
+        ctx->trackingActive.store(false);
+        ctx->vqf.reset();
+        ctx->trackingHaveTick = false;
+        ctx->trackingHaveMagTick = false;
+        ctx->trackingEverFedMag = false;
+    }
 
     // Reserve the first sequence number before transport threads can publish
     // data. The attached event is inserted at the front after initialization
@@ -1055,6 +1148,10 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
                 const libusb_interface_descriptor &id = iface.altsetting[a];
                 if (exactTarget && id.bInterfaceNumber != ctx->targetInterfaceNumber)
                     continue;
+                const bool automaticGtTarget = !exactTarget &&
+                    ctx->vid == RAYNEO_GT_VID && ctx->pid == RAYNEO_GT_PID;
+                if (automaticGtTarget && id.bInterfaceNumber != RAYNEO_GT_HID_INTERFACE)
+                    continue;
 
                 uint8_t epIn = 0;
                 uint8_t epOut = 0;
@@ -1076,6 +1173,9 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
 
                 if (exactTarget && !epIn)
                     continue;
+                if (automaticGtTarget &&
+                    (epIn != RAYNEO_GT_HID_EP_IN || epOut != RAYNEO_GT_HID_EP_OUT || epInMaxPacket < 64))
+                    continue;
 
                 ctx->interfaceNumber = id.bInterfaceNumber;
                 ctx->altSetting = id.bAlternateSetting;
@@ -1087,7 +1187,9 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         }
         libusb_free_config_descriptor(cfg);
     }
-    if (exactTarget && ctx->interfaceNumber < 0)
+    const bool automaticGtTarget = !exactTarget &&
+        ctx->vid == RAYNEO_GT_VID && ctx->pid == RAYNEO_GT_PID;
+    if ((exactTarget || automaticGtTarget) && ctx->interfaceNumber < 0)
     {
         libusb_close(ctx->handle);
         ctx->handle = nullptr;
@@ -1357,6 +1459,21 @@ RAYNEO_Result Rayneo_Stop(RAYNEO_Context ctx)
     {
         const bool was = ctx->running.exchange(false);
         ctx->rtCv.notify_all();
+        ctx->gtBiasCv.notify_all();
+        ctx->gtOrientationCv.notify_all();
+        {
+            std::lock_guard<std::mutex> lk(ctx->gtBiasMtx);
+            ctx->gtBiasCollecting = false;
+        }
+        {
+            std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+            ctx->trackingInitialized = false;
+            ctx->trackingActive.store(false);
+            ctx->vqf.reset();
+            ctx->trackingHaveTick = false;
+            ctx->trackingHaveMagTick = false;
+            ctx->trackingEverFedMag = false;
+        }
         std::unique_lock<std::mutex> commandLock(ctx->commandMtx);
         if (was)
         {
@@ -1585,6 +1702,711 @@ RAYNEO_Result Rayneo_DisplaySet2D(RAYNEO_Context ctx)
     if (!ctx) return RAYNEO_ERR_INVALID_ARG;
     if (!ctx->running.load()) return RAYNEO_ERR_NO_DEVICE;
     return Rayneo_SendCommand(ctx, kCmdDisplay2dMode, 0x00, nullptr, 0);
+}
+
+
+static bool decodeGtFactoryCalibrationFrame(const uint8_t frame[64], RAYNEO_GtFactoryCalibration &calibration)
+{
+    if (!frame || frame[0] != 0x99 || frame[1] != RAYNEO_PROTO_ACK_COMMAND || frame[8] != kCmdImuCalibration)
+        return false;
+    if (frame[9] == 0xFF)
+        return false;
+
+    calibration = {};
+    std::memcpy(calibration.raw, frame + 9, sizeof(calibration.raw));
+    for (int i = 0; i < 9; ++i)
+        std::memcpy(&calibration.transform[i], frame + 9 + i * 4, 4);
+    for (int i = 0; i < 3; ++i)
+        std::memcpy(&calibration.accelOffset[i], frame + 9 + (9 + i) * 4, 4);
+
+    for (float v : calibration.transform)
+        if (!std::isfinite(v))
+            return false;
+    for (float v : calibration.accelOffset)
+        if (!std::isfinite(v))
+            return false;
+
+    const float *m = calibration.transform;
+    const float det = m[0] * (m[4] * m[8] - m[5] * m[7])
+                    - m[1] * (m[3] * m[8] - m[5] * m[6])
+                    + m[2] * (m[3] * m[7] - m[4] * m[6]);
+    if (!std::isfinite(det) || std::fabs(det) < 1.0e-6f)
+        return false;
+
+    calibration.valid = 1;
+    return true;
+}
+
+static bool decodeGtGyroBiasFrame(const uint8_t frame[64], RAYNEO_GtGyroBiasTable &table)
+{
+    if (!frame || frame[0] != 0x99 || frame[1] != RAYNEO_PROTO_ACK_COMMAND || frame[8] != kCmdGetGyroBias)
+        return false;
+    if (frame[9] == 0xFF)
+        return false;
+
+    // RayNeo XR 2.1.1: [9]=page index, [10]=page count,
+    // [11]=signed first temperature C, [12]=entry count,
+    // [13..]=entryCount * XYZ float32.
+    const unsigned pageIndex = frame[9];
+    const unsigned pageCount = frame[10];
+    const int startTemp = static_cast<int>(static_cast<int8_t>(frame[11]));
+    const unsigned count = frame[12];
+    if (pageCount == 0 || pageIndex >= pageCount || count == 0 || count > 4 || 13u + count * 12u > 64u)
+        return false;
+
+    for (unsigned i = 0; i < count; ++i)
+    {
+        const int temp = startTemp + static_cast<int>(i);
+        if (temp < RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C || temp > RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C)
+            return false;
+        const int index = temp - RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C;
+        float bias[3]{};
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            std::memcpy(&bias[axis], frame + 13 + i * 12 + axis * 4, 4);
+            if (!std::isfinite(bias[axis]))
+                return false;
+            table.biasRadPerSec[index][axis] = bias[axis];
+        }
+        if (!table.validEntry[index])
+        {
+            table.validEntry[index] = 1;
+            ++table.validCount;
+        }
+    }
+
+    table.complete = (table.validCount == RAYNEO_GT_GYRO_BIAS_TABLE_COUNT) ? 1 : 0;
+    return true;
+}
+
+RAYNEO_Result Rayneo_QueryGtFactoryCalibration(RAYNEO_Context ctx,
+                                                uint32_t timeoutMs,
+                                                RAYNEO_GtFactoryCalibration *out)
+{
+    if (!ctx || !out)
+        return RAYNEO_ERR_INVALID_ARG;
+    if (!ctx->running.load())
+        return RAYNEO_ERR_NO_DEVICE;
+    if (ctx->vid != RAYNEO_GT_VID || ctx->pid != RAYNEO_GT_PID)
+        return RAYNEO_ERR_UNSUPPORTED;
+
+    uint8_t frame[64]{};
+    const RAYNEO_Result rc = Rayneo_RoundTrip(ctx, kCmdImuCalibration, 0x00,
+                                              nullptr, 0, timeoutMs, frame);
+    if (rc != RAYNEO_OK)
+        return rc;
+
+    RAYNEO_GtFactoryCalibration calibration{};
+    if (!decodeGtFactoryCalibrationFrame(frame, calibration))
+        return RAYNEO_ERR_IO;
+    *out = calibration;
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_QueryGtGyroBiasTable(RAYNEO_Context ctx,
+                                           uint32_t timeoutMs,
+                                           RAYNEO_GtGyroBiasTable *out)
+{
+    if (!ctx || !out)
+        return RAYNEO_ERR_INVALID_ARG;
+    if (!ctx->running.load())
+        return RAYNEO_ERR_NO_DEVICE;
+    if (ctx->vid != RAYNEO_GT_VID || ctx->pid != RAYNEO_GT_PID)
+        return RAYNEO_ERR_UNSUPPORTED;
+
+    // Request -20..+60 C and collect all 0x3E reply pages.
+    std::unique_lock<std::mutex> commandLock(ctx->commandMtx);
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtBiasMtx);
+        if (ctx->gtBiasCollecting)
+            return RAYNEO_ERR_BUSY;
+        ctx->gtBiasCollectTable = {};
+        ctx->gtBiasCollecting = true;
+    }
+
+    const uint8_t rangeCount = static_cast<uint8_t>(RAYNEO_GT_GYRO_BIAS_TABLE_COUNT);
+    uint8_t frame[64]{};
+    buildFrame(kCmdGetGyroBias,
+               static_cast<uint8_t>(static_cast<int8_t>(RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C)),
+               &rangeCount, sizeof(rangeCount), frame);
+    const RAYNEO_Result sendRc = sendRawTransport(ctx, frame);
+    if (sendRc != RAYNEO_OK)
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtBiasMtx);
+        ctx->gtBiasCollecting = false;
+        return sendRc;
+    }
+
+    const auto waitTime = std::chrono::milliseconds(timeoutMs == 0 ? 1000 : timeoutMs);
+    std::unique_lock<std::mutex> lk(ctx->gtBiasMtx);
+    const bool completed = ctx->gtBiasCv.wait_for(lk, waitTime, [&]
+    {
+        return ctx->gtBiasCollectTable.complete || !ctx->running.load();
+    });
+    ctx->gtBiasCollecting = false;
+
+    if (!ctx->running.load())
+        return RAYNEO_ERR_NO_DEVICE;
+    if (!completed || !ctx->gtBiasCollectTable.complete)
+        return RAYNEO_ERR_TIMEOUT;
+
+    *out = ctx->gtBiasCollectTable;
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GetGtGyroBiasAtTemperature(const RAYNEO_GtGyroBiasTable *table,
+                                                 float temperatureC,
+                                                 float outBiasRadPerSec[3])
+{
+    if (!table || !outBiasRadPerSec || !std::isfinite(temperatureC) || table->validCount == 0)
+        return RAYNEO_ERR_INVALID_ARG;
+
+    const float clamped = std::max(static_cast<float>(RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C),
+                                   std::min(static_cast<float>(RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C), temperatureC));
+    const int loTemp = static_cast<int>(std::floor(clamped));
+    const int hiTemp = static_cast<int>(std::ceil(clamped));
+
+    auto validAt = [&](int temp) -> bool
+    {
+        if (temp < RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C || temp > RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C)
+            return false;
+        return table->validEntry[temp - RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C] != 0;
+    };
+
+    int lo = loTemp;
+    while (lo >= RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C && !validAt(lo))
+        --lo;
+    int hi = hiTemp;
+    while (hi <= RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C && !validAt(hi))
+        ++hi;
+    if (lo < RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C)
+    {
+        lo = hi;
+        if (lo > RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C)
+            return RAYNEO_ERR_IO;
+    }
+    if (hi > RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C)
+        hi = lo;
+
+    const int loIndex = lo - RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C;
+    const int hiIndex = hi - RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C;
+    const float alpha = (hi == lo) ? 0.0f
+                                    : (clamped - static_cast<float>(lo)) / static_cast<float>(hi - lo);
+    for (int axis = 0; axis < 3; ++axis)
+        outBiasRadPerSec[axis] = table->biasRadPerSec[loIndex][axis] * (1.0f - alpha)
+                               + table->biasRadPerSec[hiIndex][axis] * alpha;
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_ApplyGtSensorCalibration(const RAYNEO_GtFactoryCalibration *calibration,
+                                               const RAYNEO_GtGyroBiasTable *biasTable,
+                                               const RAYNEO_ImuSample *input,
+                                               RAYNEO_ImuSample *output)
+{
+    if (!calibration || !input || !output || !calibration->valid || !input->valid)
+        return RAYNEO_ERR_INVALID_ARG;
+
+    float gyroBias[3]{};
+    if (biasTable && biasTable->validCount)
+    {
+        const RAYNEO_Result biasRc = Rayneo_GetGtGyroBiasAtTemperature(
+            biasTable, input->temperature, gyroBias);
+        if (biasRc != RAYNEO_OK)
+            return biasRc;
+    }
+
+    RAYNEO_ImuSample corrected = *input;
+    float gyroUnbiasedRad[3]{};
+    for (int i = 0; i < 3; ++i)
+        gyroUnbiasedRad[i] = input->gyroRad[i] - gyroBias[i];
+
+    for (int row = 0; row < 3; ++row)
+    {
+        corrected.acc[row] = calibration->accelOffset[row];
+        corrected.gyroRad[row] = 0.0f;
+        for (int col = 0; col < 3; ++col)
+        {
+            const float m = calibration->transform[row * 3 + col];
+            corrected.acc[row] += m * input->acc[col];
+            corrected.gyroRad[row] += m * gyroUnbiasedRad[col];
+        }
+        corrected.gyroDps[row] = corrected.gyroRad[row] * 57.295779513082320876f;
+    }
+
+    *output = corrected;
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_ApplyGtRuntimeAxes(const RAYNEO_ImuSample *input,
+                                        RAYNEO_ImuSample *output)
+{
+    if (!input || !output || !input->valid)
+        return RAYNEO_ERR_INVALID_ARG;
+
+    RAYNEO_ImuSample mapped = *input;
+    // GT/Gemini runtime mapping: [x,y,z] -> [x,-z,y].
+    mapped.acc[0] = input->acc[0];
+    mapped.acc[1] = -input->acc[2];
+    mapped.acc[2] = input->acc[1];
+    mapped.gyroRad[0] = input->gyroRad[0];
+    mapped.gyroRad[1] = -input->gyroRad[2];
+    mapped.gyroRad[2] = input->gyroRad[1];
+    mapped.gyroDps[0] = input->gyroDps[0];
+    mapped.gyroDps[1] = -input->gyroDps[2];
+    mapped.gyroDps[2] = input->gyroDps[1];
+    mapped.magnet[0] = input->magnet[0];
+    mapped.magnet[1] = -input->magnet[2];
+    mapped.magnet[2] = input->magnet[1];
+    *output = mapped;
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_PrepareGtImuSample(const RAYNEO_GtFactoryCalibration *calibration,
+                                        const RAYNEO_GtGyroBiasTable *biasTable,
+                                        const RAYNEO_ImuSample *input,
+                                        RAYNEO_ImuSample *output)
+{
+    if (!calibration || !input || !output)
+        return RAYNEO_ERR_INVALID_ARG;
+    RAYNEO_ImuSample calibrated{};
+    const RAYNEO_Result rc = Rayneo_ApplyGtSensorCalibration(calibration, biasTable, input, &calibrated);
+    if (rc != RAYNEO_OK)
+        return rc;
+    return Rayneo_ApplyGtRuntimeAxes(&calibrated, output);
+}
+
+static bool isFiniteVector3(const float v[3])
+{
+    return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
+}
+
+static float vectorNorm3(const float v[3])
+{
+    return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+static bool validFusionMode(int32_t mode)
+{
+    return mode == RAYNEO_GT_FUSION_6D ||
+           mode == RAYNEO_GT_FUSION_AUTO_9D ||
+           mode == RAYNEO_GT_FUSION_FORCE_9D;
+}
+
+static void makeIdentityGtCalibration(RAYNEO_GtFactoryCalibration &calibration)
+{
+    calibration = {};
+    calibration.transform[0] = 1.0f;
+    calibration.transform[4] = 1.0f;
+    calibration.transform[8] = 1.0f;
+    calibration.valid = 1;
+}
+
+static bool rebuildGtFusionLocked(RayneoContext__ *ctx)
+{
+    if (!ctx || !validFusionMode(ctx->trackingConfig.fusionMode))
+        return false;
+
+    VQFParams params;
+#ifndef VQF_NO_MOTION_BIAS_ESTIMATION
+    params.motionBiasEstEnabled = true;
+#endif
+    params.restBiasEstEnabled = true;
+    params.magDistRejectionEnabled = ctx->trackingConfig.fusionMode != RAYNEO_GT_FUSION_FORCE_9D;
+
+    try
+    {
+        ctx->vqf = std::make_unique<VQF>(params,
+                                         1.0f / RAYNEO_GT_VQF_IMU_HZ,
+                                         1.0f / RAYNEO_GT_VQF_IMU_HZ,
+                                         1.0f / RAYNEO_GT_VQF_MAG_HZ);
+    }
+    catch (...)
+    {
+        ctx->vqf.reset();
+        return false;
+    }
+
+    ctx->trackingHaveTick = false;
+    ctx->trackingHaveMagTick = false;
+    ctx->trackingEverFedMag = false;
+    ctx->trackingLastTick = 0;
+    ctx->trackingLastMagTick = 0;
+    ctx->trackingTimestampNs = 0;
+    return true;
+}
+
+static void transformTemperatureBiasToRuntime(const RAYNEO_GtFactoryCalibration &calibration,
+                                              const float packageBias[3],
+                                              float runtimeBias[3])
+{
+    float transformed[3]{};
+    for (int row = 0; row < 3; ++row)
+        for (int col = 0; col < 3; ++col)
+            transformed[row] += calibration.transform[row * 3 + col] * packageBias[col];
+
+    runtimeBias[0] = transformed[0];
+    runtimeBias[1] = -transformed[2];
+    runtimeBias[2] = transformed[1];
+}
+
+static void enqueueGtOrientation(RayneoContext__ *ctx, const RAYNEO_GtOrientation &orientation)
+{
+    if (!ctx)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        if (ctx->gtOrientationQueue.size() >= ctx->maxGtOrientationQueue)
+            ctx->gtOrientationQueue.pop_front();
+        ctx->gtOrientationQueue.push_back(orientation);
+        ctx->lastGtOrientation = orientation;
+    }
+    ctx->gtOrientationCv.notify_one();
+}
+
+static void processGtOrientation(RayneoContext__ *ctx, const RAYNEO_ImuSample &sample)
+{
+    if (!ctx || !sample.valid || ctx->vid != RAYNEO_GT_VID || ctx->pid != RAYNEO_GT_PID)
+        return;
+
+    RAYNEO_GtOrientation orientation{};
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        if (!ctx->trackingInitialized || !ctx->vqf)
+            return;
+
+        RAYNEO_ImuSample prepared{};
+        const RAYNEO_GtGyroBiasTable *biasTable =
+            ctx->trackingBiasTable.validCount ? &ctx->trackingBiasTable : nullptr;
+        if (Rayneo_PrepareGtImuSample(&ctx->trackingCalibration, biasTable, &sample, &prepared) != RAYNEO_OK)
+            return;
+
+        float packageTempBias[3]{};
+        if (biasTable &&
+            Rayneo_GetGtGyroBiasAtTemperature(biasTable, sample.temperature, packageTempBias) == RAYNEO_OK)
+        {
+            transformTemperatureBiasToRuntime(ctx->trackingCalibration, packageTempBias,
+                                              orientation.appliedTemperatureBiasRadPerSec);
+        }
+
+        float mag[3] = {prepared.magnet[0], prepared.magnet[1], prepared.magnet[2]};
+        if (ctx->trackingMagCalibration.valid)
+        {
+            for (int i = 0; i < 3; ++i)
+                mag[i] = (mag[i] - ctx->trackingMagCalibration.hardIron[i]) *
+                         ctx->trackingMagCalibration.scale[i];
+        }
+
+        const bool magFinite = isFiniteVector3(mag);
+        const float magNorm = magFinite ? vectorNorm3(mag) : 0.0f;
+        const bool magUsable = magFinite && std::isfinite(magNorm) && magNorm > 1.0e-6f;
+
+        bool didReset = false;
+        if (!ctx->trackingHaveTick)
+        {
+            ctx->trackingHaveTick = true;
+            ctx->trackingLastTick = sample.tick;
+            ctx->trackingTimestampNs = 0;
+            didReset = true;
+        }
+        else
+        {
+            const uint32_t deltaTicks = static_cast<uint32_t>(sample.tick - ctx->trackingLastTick);
+            ctx->trackingLastTick = sample.tick;
+            ctx->trackingTimestampNs += static_cast<uint64_t>(deltaTicks) *
+                                        static_cast<uint64_t>(RAYNEO_GT_SENSOR_TICK_US) * 1000ull;
+            const uint64_t maxGapTicks =
+                (static_cast<uint64_t>(RAYNEO_GT_FUSION_MAX_GAP_MS) * RAYNEO_GT_SENSOR_TICK_HZ + 999u) / 1000u;
+            if (deltaTicks == 0 || deltaTicks > maxGapTicks)
+            {
+                ctx->vqf->resetState();
+                ctx->trackingHaveMagTick = false;
+                ctx->trackingEverFedMag = false;
+                didReset = true;
+            }
+        }
+
+        vqf_real_t gyr[3] = {prepared.gyroRad[0], prepared.gyroRad[1], prepared.gyroRad[2]};
+        vqf_real_t acc[3] = {prepared.acc[0], prepared.acc[1], prepared.acc[2]};
+        ctx->vqf->updateGyr(gyr);
+        ctx->vqf->updateAcc(acc);
+
+        const bool wantsMag = ctx->trackingConfig.fusionMode != RAYNEO_GT_FUSION_6D;
+        if (wantsMag && magUsable)
+        {
+            const uint32_t magPeriodTicks = std::max<uint32_t>(
+                1u, static_cast<uint32_t>(std::lround(
+                    static_cast<double>(RAYNEO_GT_SENSOR_TICK_HZ) / RAYNEO_GT_VQF_MAG_HZ)));
+            const uint32_t sinceMag = ctx->trackingHaveMagTick
+                                          ? static_cast<uint32_t>(sample.tick - ctx->trackingLastMagTick)
+                                          : magPeriodTicks;
+            if (!ctx->trackingHaveMagTick || sinceMag >= magPeriodTicks)
+            {
+                vqf_real_t m[3] = {mag[0], mag[1], mag[2]};
+                ctx->vqf->updateMag(m);
+                ctx->trackingHaveMagTick = true;
+                ctx->trackingEverFedMag = true;
+                ctx->trackingLastMagTick = sample.tick;
+            }
+        }
+
+        vqf_real_t q[4]{};
+        if (wantsMag && ctx->trackingEverFedMag)
+            ctx->vqf->getQuat9D(q);
+        else
+            ctx->vqf->getQuat6D(q);
+
+        vqf_real_t residualBias[3]{};
+        (void)ctx->vqf->getBiasEstimate(residualBias);
+
+        for (int i = 0; i < 4; ++i)
+            orientation.quat[i] = static_cast<float>(q[i]);
+        orientation.timestampNs = ctx->trackingTimestampNs;
+        orientation.tick = sample.tick;
+        orientation.count = sample.count;
+        orientation.temperature = sample.temperature;
+        for (int i = 0; i < 3; ++i)
+        {
+            orientation.residualBiasRadPerSec[i] = static_cast<float>(residualBias[i]);
+            orientation.magnetRuntime[i] = mag[i];
+        }
+        orientation.magnetFieldStrength = magNorm;
+        orientation.fusionMode = ctx->trackingConfig.fusionMode;
+        orientation.valid = 1;
+        orientation.magneticDisturbance =
+            wantsMag && ctx->trackingEverFedMag && ctx->vqf->getMagDistDetected() ? 1 : 0;
+        orientation.restDetected = ctx->vqf->getRestDetected() ? 1 : 0;
+        orientation.usingMagnetometer =
+            wantsMag && ctx->trackingEverFedMag &&
+            (ctx->trackingConfig.fusionMode == RAYNEO_GT_FUSION_FORCE_9D || !orientation.magneticDisturbance)
+                ? 1 : 0;
+        orientation.factoryCalibrationValid = ctx->trackingFactoryFromDevice ? 1 : 0;
+        orientation.temperatureBiasValid = ctx->trackingBiasFromDevice ? 1 : 0;
+        orientation.magnetometerCalibrationValid = ctx->trackingMagCalibration.valid ? 1 : 0;
+        orientation.fusionReset = didReset ? 1 : 0;
+    }
+
+    enqueueGtOrientation(ctx, orientation);
+}
+
+void Rayneo_GtTrackingConfigInit(RAYNEO_GtTrackingConfig *config)
+{
+    if (!config)
+        return;
+    *config = {};
+    config->structSize = sizeof(*config);
+    config->fusionMode = RAYNEO_GT_FUSION_6D;
+    config->requireFactoryCalibration = 1;
+    config->requireTemperatureBias = 0;
+}
+
+RAYNEO_Result Rayneo_GtInitializeTracking(RAYNEO_Context ctx,
+                                           const RAYNEO_GtTrackingConfig *config,
+                                           uint32_t timeoutMs)
+{
+    if (!ctx)
+        return RAYNEO_ERR_INVALID_ARG;
+    if (!ctx->running.load())
+        return RAYNEO_ERR_NO_DEVICE;
+    if (ctx->vid != RAYNEO_GT_VID || ctx->pid != RAYNEO_GT_PID)
+        return RAYNEO_ERR_UNSUPPORTED;
+
+    RAYNEO_GtTrackingConfig cfg{};
+    Rayneo_GtTrackingConfigInit(&cfg);
+    if (config)
+    {
+        if (config->structSize < sizeof(RAYNEO_GtTrackingConfig) || !validFusionMode(config->fusionMode))
+            return RAYNEO_ERR_INVALID_ARG;
+        cfg = *config;
+    }
+
+    RAYNEO_GtFactoryCalibration calibration{};
+    bool factoryFromDevice = false;
+    RAYNEO_Result rc = Rayneo_QueryGtFactoryCalibration(ctx, timeoutMs, &calibration);
+    if (rc == RAYNEO_OK)
+        factoryFromDevice = true;
+    else if (cfg.requireFactoryCalibration)
+        return rc;
+    else
+        makeIdentityGtCalibration(calibration);
+
+    RAYNEO_GtGyroBiasTable biasTable{};
+    bool biasFromDevice = false;
+    rc = Rayneo_QueryGtGyroBiasTable(ctx, timeoutMs, &biasTable);
+    if (rc == RAYNEO_OK && biasTable.complete)
+        biasFromDevice = true;
+    else if (cfg.requireTemperatureBias)
+        return rc == RAYNEO_OK ? RAYNEO_ERR_IO : rc;
+    else
+        biasTable = {};
+
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        ctx->trackingConfig = cfg;
+        ctx->trackingCalibration = calibration;
+        ctx->trackingBiasTable = biasTable;
+        ctx->trackingFactoryFromDevice = factoryFromDevice;
+        ctx->trackingBiasFromDevice = biasFromDevice;
+        if (!rebuildGtFusionLocked(ctx))
+            return RAYNEO_ERR_GENERAL;
+        ctx->trackingInitialized = true;
+        ctx->trackingActive.store(true);
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        ctx->gtOrientationQueue.clear();
+        ctx->lastGtOrientation = {};
+    }
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtShutdownTracking(RAYNEO_Context ctx)
+{
+    if (!ctx)
+        return RAYNEO_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        ctx->trackingInitialized = false;
+        ctx->trackingActive.store(false);
+        ctx->vqf.reset();
+        ctx->trackingHaveTick = false;
+        ctx->trackingHaveMagTick = false;
+        ctx->trackingEverFedMag = false;
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        ctx->gtOrientationQueue.clear();
+        ctx->lastGtOrientation = {};
+    }
+    ctx->gtOrientationCv.notify_all();
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtResetFusion(RAYNEO_Context ctx)
+{
+    if (!ctx)
+        return RAYNEO_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        if (!ctx->trackingInitialized)
+            return RAYNEO_ERR_UNSUPPORTED;
+        if (!rebuildGtFusionLocked(ctx))
+            return RAYNEO_ERR_GENERAL;
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        ctx->gtOrientationQueue.clear();
+        ctx->lastGtOrientation = {};
+    }
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtSetFusionMode(RAYNEO_Context ctx, RAYNEO_GtFusionMode mode)
+{
+    if (!ctx || !validFusionMode(static_cast<int32_t>(mode)))
+        return RAYNEO_ERR_INVALID_ARG;
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        if (!ctx->trackingInitialized)
+            return RAYNEO_ERR_UNSUPPORTED;
+        ctx->trackingConfig.fusionMode = static_cast<int32_t>(mode);
+        if (!rebuildGtFusionLocked(ctx))
+            return RAYNEO_ERR_GENERAL;
+    }
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        ctx->gtOrientationQueue.clear();
+        ctx->lastGtOrientation = {};
+    }
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtSetMagCalibration(RAYNEO_Context ctx,
+                                          const RAYNEO_GtMagCalibration *calibration)
+{
+    if (!ctx || !calibration)
+        return RAYNEO_ERR_INVALID_ARG;
+
+    RAYNEO_GtMagCalibration next{};
+    if (calibration->valid)
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            if (!std::isfinite(calibration->hardIron[i]) ||
+                !std::isfinite(calibration->scale[i]) || calibration->scale[i] <= 0.0f)
+                return RAYNEO_ERR_INVALID_ARG;
+        }
+        next = *calibration;
+    }
+    else
+    {
+        // Zero/invalid calibration disables host-side magnetometer correction.
+        next.scale[0] = next.scale[1] = next.scale[2] = 1.0f;
+        next.valid = 0;
+    }
+
+    bool resetFusion = false;
+    {
+        std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+        ctx->trackingMagCalibration = next;
+        if (ctx->trackingInitialized)
+        {
+            if (!rebuildGtFusionLocked(ctx))
+                return RAYNEO_ERR_GENERAL;
+            resetFusion = true;
+        }
+    }
+    if (resetFusion)
+    {
+        std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+        ctx->gtOrientationQueue.clear();
+        ctx->lastGtOrientation = {};
+    }
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtGetMagCalibration(RAYNEO_Context ctx, RAYNEO_GtMagCalibration *out)
+{
+    if (!ctx || !out)
+        return RAYNEO_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(ctx->trackingMtx);
+    *out = ctx->trackingMagCalibration;
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtPollOrientation(RAYNEO_Context ctx,
+                                        RAYNEO_GtOrientation *out,
+                                        uint32_t timeoutMs)
+{
+    if (!ctx || !out)
+        return RAYNEO_ERR_INVALID_ARG;
+    if (!ctx->trackingActive.load())
+        return RAYNEO_ERR_UNSUPPORTED;
+
+    std::unique_lock<std::mutex> lk(ctx->gtOrientationMtx);
+    ctx->gtOrientationCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&]
+    {
+        return !ctx->gtOrientationQueue.empty() || !ctx->running.load() || !ctx->trackingActive.load();
+    });
+    if (ctx->gtOrientationQueue.empty())
+    {
+        if (!ctx->running.load())
+            return RAYNEO_ERR_NO_DEVICE;
+        if (!ctx->trackingActive.load())
+            return RAYNEO_ERR_UNSUPPORTED;
+        return RAYNEO_ERR_TIMEOUT;
+    }
+    *out = ctx->gtOrientationQueue.front();
+    ctx->gtOrientationQueue.pop_front();
+    return RAYNEO_OK;
+}
+
+RAYNEO_Result Rayneo_GtGetLastOrientation(RAYNEO_Context ctx, RAYNEO_GtOrientation *out)
+{
+    if (!ctx || !out)
+        return RAYNEO_ERR_INVALID_ARG;
+    std::lock_guard<std::mutex> lk(ctx->gtOrientationMtx);
+    *out = ctx->lastGtOrientation;
+    return out->valid ? RAYNEO_OK : RAYNEO_ERR_TIMEOUT;
 }
 
 RAYNEO_Result Rayneo_GetLastImu(RAYNEO_Context ctx, RAYNEO_ImuSample *out)

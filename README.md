@@ -29,7 +29,7 @@ The project currently focuses on:
 | --- | --- | --- | --- | --- |
 | RayNeo Air 3S Pro | `0x1BBB` | `0xAF50` | Original SDK target; included in device discovery. | - |
 | RayNeo Air 4 Pro | `0x1BBB` | `0xAF50` | IMU streaming reported working by a user on macOS / Apple Silicon; discovered through the shared Air 3S Pro USB identity. | [#4: macOS compatibility report](https://github.com/verncat/RayNeo-Air-3S-Pro-OpenVR/issues/4) |
-| RayNeo GT | `0x3941` | `0xAF50` | Included in device discovery, with model-specific spatial-mode notification handling. | [PR #3: GT support and hardware testing](https://github.com/verncat/RayNeo-Air-3S-Pro-OpenVR/pull/3) |
+| RayNeo GT | `0x3941` | `0xAF50` | Discovery, GT HID interface selection, raw IMU, and optional GT calibration/fused-orientation API. | [PR #3: GT support and hardware testing](https://github.com/verncat/RayNeo-Air-3S-Pro-OpenVR/pull/3) |
 
 Air 3S Pro and Air 4 Pro share the same VID/PID, so discovery cannot distinguish
 them by these identifiers alone. The examples display both possible model names.
@@ -124,6 +124,45 @@ share one entry. For multiple different matches, the application chooses a pair.
 only `capacity` entries are written and `count` still reports the total.
 On macOS discovery enumerates HID devices; Windows/Linux use libusb.
 
+## RayNeo GT / Gemini tracking API
+
+SDK 1.5 adds a GT/Gemini tracking path without changing the existing
+`RAYNEO_Event` layout or Air behavior. On Windows/Linux, automatic GT transport
+uses the runtime HID topology (interface 5,
+OUT `0x04`, IN `0x85`, 64-byte input reports). An interface selected explicitly
+with `Rayneo_SetTargetInterface` still takes precedence.
+
+The GT-specific raw `0x65` trailer is decoded as a 32-bit sample counter at
+bytes 56..59, checksum at byte 62, and flag at byte 63. The existing Air parser
+path keeps its previous trailer interpretation.
+
+The higher-level GT path is optional:
+
+```text
+raw GT IMU
+  -> 0x3C factory 3DoF calibration (3x3 transform + accel offset)
+  -> optional 0x3E temperature-indexed gyro-bias correction
+  -> GT runtime axes [x,y,z] -> [x,-z,y]
+  -> VQF 6D, or optional magnetometer-assisted VQF 9D
+  -> RAYNEO_GtOrientation quaternion
+```
+
+`RAYNEO_GtOrientation` is delivered through the separate
+`Rayneo_GtPollOrientation` / `Rayneo_GtGetLastOrientation` API, so existing
+`RAYNEO_Event` consumers keep the same ABI and continue receiving raw IMU and
+device events exactly as before. The SDK default is 6D
+(gyro + accelerometer). `AUTO_9D` adds GT magnetometer input with VQF magnetic
+disturbance rejection; `FORCE_9D` is intended for diagnostics. These are all
+3DoF orientation modes; no translation is estimated.
+
+The `0x3E` request covers `-20..+60 C`, matching RayNeo XR host behavior.
+Bias values are currently interpreted in rad/s because RayNeo XR converts packet
+gyro data to rad/s before calibration/fusion; sign and units should still be
+validated against stationary GT hardware over temperature. No calibration data
+is written back to the glasses by this tracking API.
+
+See `examples/gt_probe` for protocol and fusion diagnostics.
+
 ## Repository Layout
 
 ```
@@ -135,6 +174,7 @@ examples/                     # Example apps
 openvr_driver/                # Optional stub driver
 rayneoSDKHeaders/             # Additional internal headers (not yet fully used) from original SDK
 thirdparties/openvr/          # Third-party OpenVR bits
+thirdparties/vqf/             # VQF 2.1.2 used by optional GT orientation
 ```
 
 ## Building
@@ -198,6 +238,9 @@ macOS path uses IOKit HID APIs directly. A worker thread runs a CFRunLoop, regis
 ## License
 
 This project is released under the **MIT License** — see the [LICENSE](LICENSE) file.
+The optional GT orientation service embeds VQF 2.1.2 under the MIT License; see
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and
+`thirdparties/vqf/LICENSE-MIT.txt`.
 
 ## Contributing
 

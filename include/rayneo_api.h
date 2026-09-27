@@ -27,6 +27,14 @@
 #define RAYNEO_GT_VID 0x3941
 #define RAYNEO_GT_PID 0xAF50
 
+// GT/Gemini runtime HID topology used by automatic selection. Explicit
+// interface selection takes precedence.
+#define RAYNEO_GT_HID_INTERFACE 5
+#define RAYNEO_GT_HID_EP_OUT 0x04
+#define RAYNEO_GT_HID_EP_IN 0x85
+#define RAYNEO_GT_SENSOR_TICK_HZ 10000u
+#define RAYNEO_GT_SENSOR_TICK_US 100u
+
 // Add supported models here; discovery and the constexpr list share this table.
 #define RAYNEO_SUPPORTED_DEVICES(X) \
     X(AIR_3S_PRO, RAYNEO_AIR_3S_PRO_VID, RAYNEO_AIR_3S_PRO_PID) \
@@ -60,8 +68,9 @@ extern "C" {
 // Minor 2: added RAYNEO_EVENT_NOTIFY (sleep/wake notifications) and notify union member
 // Minor 3: added Rayneo_SetTargetInterface and RAYNEO_NOTIFY_BUTTON_SPATIAL_MODE
 // Minor 4: supported device table and Rayneo_Discovery.
-#define RAYNEO_API_VERSION_MINOR 4
-#define RAYNEO_API_VERSION_PATCH 1
+// Minor 5: backward-compatible GT/Gemini calibration and fused-orientation API.
+#define RAYNEO_API_VERSION_MINOR 5
+#define RAYNEO_API_VERSION_PATCH 0
 
 #define RAYNEO_STRINGIFY_IMPL(value) #value
 #define RAYNEO_STRINGIFY(value) RAYNEO_STRINGIFY_IMPL(value)
@@ -129,6 +138,75 @@ typedef struct RAYNEO_ImuSample {
     uint8_t  valid;      // 1 if filled
     uint8_t  reserved;   // future use
 } RAYNEO_ImuSample;
+
+// ---- GT/Gemini calibration and fused orientation (added in 1.5) ----
+// Kept separate from RAYNEO_Event to preserve its ABI.
+
+typedef struct RAYNEO_GtFactoryCalibration {
+    float   transform[9];     // row-major 3x3 Tsb matrix from command 0x3C
+    float   accelOffset[3];   // accelerometer offset Ta from command 0x3C
+    uint8_t raw[48];
+    uint8_t valid;
+    uint8_t reserved[3];
+} RAYNEO_GtFactoryCalibration;
+
+#define RAYNEO_GT_GYRO_BIAS_MIN_TEMP_C (-20)
+#define RAYNEO_GT_GYRO_BIAS_MAX_TEMP_C (60)
+#define RAYNEO_GT_GYRO_BIAS_TABLE_COUNT (81)
+
+typedef struct RAYNEO_GtGyroBiasTable {
+    float   biasRadPerSec[RAYNEO_GT_GYRO_BIAS_TABLE_COUNT][3];
+    uint8_t validEntry[RAYNEO_GT_GYRO_BIAS_TABLE_COUNT];
+    uint8_t complete;
+    uint8_t validCount;
+    uint8_t reserved[2];
+} RAYNEO_GtGyroBiasTable;
+
+// "6D"/"9D" here refer to six/nine sensor axes, not positional DoF. All
+// modes below output 3DoF orientation only.
+typedef enum RAYNEO_GtFusionMode {
+    RAYNEO_GT_FUSION_6D = 0, // gyro + accelerometer
+    RAYNEO_GT_FUSION_AUTO_9D   = 1, // +magnetometer with disturbance rejection
+    RAYNEO_GT_FUSION_FORCE_9D  = 2  // diagnostic: +magnetometer without rejection
+} RAYNEO_GtFusionMode;
+
+// VQF tuning remains internal to the SDK.
+typedef struct RAYNEO_GtTrackingConfig {
+    uint32_t structSize;
+    int32_t  fusionMode;
+    uint8_t  requireFactoryCalibration;
+    uint8_t  requireTemperatureBias;
+    uint8_t  reserved[6];
+} RAYNEO_GtTrackingConfig;
+
+typedef struct RAYNEO_GtMagCalibration {
+    float hardIron[3]; // subtract before per-axis scale
+    float scale[3];    // normally near 1.0
+    uint8_t valid;
+    uint8_t reserved[3];
+} RAYNEO_GtMagCalibration;
+
+// GT orientation channel. Quaternion order is [w,x,y,z]; translation is not estimated.
+typedef struct RAYNEO_GtOrientation {
+    float    quat[4];
+    uint64_t timestampNs; // relative sensor time since the first fused sample
+    uint32_t tick;
+    uint32_t count;
+    float    temperature;
+    float    appliedTemperatureBiasRadPerSec[3];
+    float    residualBiasRadPerSec[3];
+    float    magnetRuntime[3];
+    float    magnetFieldStrength; // norm in the raw packet's magnetic units
+    int32_t  fusionMode;
+    uint8_t  valid;
+    uint8_t  usingMagnetometer;
+    uint8_t  magneticDisturbance;
+    uint8_t  restDetected;
+    uint8_t  factoryCalibrationValid;
+    uint8_t  temperatureBiasValid;
+    uint8_t  magnetometerCalibrationValid;
+    uint8_t  fusionReset;
+} RAYNEO_GtOrientation;
 
 // Device info (mini) returned from command 0x00 (type 0xC8 ack). Originally only raw[60] was exposed.
 // Minor version 1 adds decoded fields after the original prefix for convenience.
@@ -232,6 +310,37 @@ RAYNEO_API RAYNEO_Result Rayneo_DisableImu(RAYNEO_Context ctx);
 RAYNEO_API RAYNEO_Result Rayneo_RequestDeviceInfo(RAYNEO_Context ctx);
 RAYNEO_API RAYNEO_Result Rayneo_DisplaySet3D(RAYNEO_Context ctx);
 RAYNEO_API RAYNEO_Result Rayneo_DisplaySet2D(RAYNEO_Context ctx);
+
+// GT/Gemini calibration helpers. These require a running GT context.
+RAYNEO_API RAYNEO_Result Rayneo_QueryGtFactoryCalibration(RAYNEO_Context ctx, uint32_t timeoutMs, RAYNEO_GtFactoryCalibration* out);
+RAYNEO_API RAYNEO_Result Rayneo_QueryGtGyroBiasTable(RAYNEO_Context ctx, uint32_t timeoutMs, RAYNEO_GtGyroBiasTable* out);
+RAYNEO_API RAYNEO_Result Rayneo_GetGtGyroBiasAtTemperature(const RAYNEO_GtGyroBiasTable* table,
+                                                           float temperatureC,
+                                                           float outBiasRadPerSec[3]);
+RAYNEO_API RAYNEO_Result Rayneo_ApplyGtSensorCalibration(const RAYNEO_GtFactoryCalibration* calibration,
+                                                         const RAYNEO_GtGyroBiasTable* biasTable,
+                                                         const RAYNEO_ImuSample* input,
+                                                         RAYNEO_ImuSample* output);
+RAYNEO_API RAYNEO_Result Rayneo_ApplyGtRuntimeAxes(const RAYNEO_ImuSample* input,
+                                                   RAYNEO_ImuSample* output);
+RAYNEO_API RAYNEO_Result Rayneo_PrepareGtImuSample(const RAYNEO_GtFactoryCalibration* calibration,
+                                                   const RAYNEO_GtGyroBiasTable* biasTable,
+                                                   const RAYNEO_ImuSample* input,
+                                                   RAYNEO_ImuSample* output);
+
+// Optional GT/Gemini orientation service. Initialization queries 0x3C and 0x3E;
+// raw IMU events remain unchanged and fused samples use the GT orientation channel.
+RAYNEO_API void          Rayneo_GtTrackingConfigInit(RAYNEO_GtTrackingConfig* config);
+RAYNEO_API RAYNEO_Result Rayneo_GtInitializeTracking(RAYNEO_Context ctx,
+                                                     const RAYNEO_GtTrackingConfig* config,
+                                                     uint32_t timeoutMs);
+RAYNEO_API RAYNEO_Result Rayneo_GtShutdownTracking(RAYNEO_Context ctx);
+RAYNEO_API RAYNEO_Result Rayneo_GtResetFusion(RAYNEO_Context ctx);
+RAYNEO_API RAYNEO_Result Rayneo_GtSetFusionMode(RAYNEO_Context ctx, RAYNEO_GtFusionMode mode);
+RAYNEO_API RAYNEO_Result Rayneo_GtSetMagCalibration(RAYNEO_Context ctx, const RAYNEO_GtMagCalibration* calibration);
+RAYNEO_API RAYNEO_Result Rayneo_GtGetMagCalibration(RAYNEO_Context ctx, RAYNEO_GtMagCalibration* out);
+RAYNEO_API RAYNEO_Result Rayneo_GtPollOrientation(RAYNEO_Context ctx, RAYNEO_GtOrientation* out, uint32_t timeoutMs);
+RAYNEO_API RAYNEO_Result Rayneo_GtGetLastOrientation(RAYNEO_Context ctx, RAYNEO_GtOrientation* out);
 
 // Snapshots of last parsed data
 RAYNEO_API RAYNEO_Result Rayneo_GetLastImu(RAYNEO_Context ctx, RAYNEO_ImuSample* out);

@@ -124,14 +124,36 @@ else()
 endif()
 
 # RayNeo C API shared library -------------------------------------------------
+# Keep the vendored VQF implementation private to RayNeoSDK instead of adding
+# its C++ symbols to the SDK's exported ELF/Mach-O surface.
+add_library(RayNeoVQF OBJECT
+    thirdparties/vqf/vqf.cpp
+)
+target_include_directories(RayNeoVQF PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/thirdparties/vqf)
+target_compile_definitions(RayNeoVQF PRIVATE VQF_SINGLE_PRECISION)
+target_compile_features(RayNeoVQF PRIVATE cxx_std_17)
+set_target_properties(RayNeoVQF PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN YES
+)
+
 add_library(RayNeoSDK SHARED
     src/RayneoApi.cpp
+    $<TARGET_OBJECTS:RayNeoVQF>
 )
 
 target_include_directories(RayNeoSDK
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/thirdparties/vqf
 )
+
+# RayneoApi.cpp includes vqf.hpp, so both translation units must agree on the
+# VQF scalar type.
+target_compile_definitions(RayNeoSDK PRIVATE VQF_SINGLE_PRECISION)
+target_compile_features(RayNeoSDK PRIVATE cxx_std_17)
 
 target_link_libraries(RayNeoSDK
     PRIVATE
@@ -154,6 +176,7 @@ endif()
 set_target_properties(RayNeoSDK PROPERTIES
     BUILD_RPATH "${_RAYNEO_RPATH}"
     INSTALL_RPATH "${_RAYNEO_RPATH}"
+    VISIBILITY_INLINES_HIDDEN YES
 )
 
 if (WIN32)
@@ -174,4 +197,5 @@ endif()
 if (RAYNEO_BUILD_EXAMPLES)
     add_subdirectory(examples/simple)
     add_subdirectory(examples/orientation_demo)
+    add_subdirectory(examples/gt_probe)
 endif()
