@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <cstdarg>
 
 #ifdef __APPLE__
@@ -18,6 +19,13 @@
 #include <CoreFoundation/CoreFoundation.h>
 #else
 #include <libusb.h>
+#endif
+
+#ifndef __APPLE__
+static const char *rayneoUsbErr(int code)
+{
+    return libusb_error_name(code);
+}
 #endif
 
 struct RayneoContext__
@@ -154,8 +162,6 @@ enum FXRUsbCommand {
     kCmdTimeSynchronize = 0xE1, //设备间时钟同步
 };
 
-static constexpr uint16_t RAYNEO_GT_VID = 0x3941;
-static constexpr uint16_t RAYNEO_GT_PID = 0xAF50;
 static constexpr uint8_t RAYNEO_GT_NOTIFY_SPATIAL_MODE = 0x08;
 
 static void enqueueEvent(RayneoContext__ *ctx, const RAYNEO_Event &evt);
@@ -367,8 +373,13 @@ static void processInboundFrame(RayneoContext__ *ctx, const uint8_t *buf, size_t
             enqueueEvent(ctx, evt);
             return;
 
-        } else if (value != kCmdDeviceInfo) {
+        } else if (value == kCmdDisplay3dMode ||
+                   value == kCmdDisplay2dMode ||
+                   value == kCmdVolumeSet) {
             return;
+
+        } else if (value != 0) {
+            printf("[SimpleClient] Unknown Notify? 0x%02X\n", value);
         }
 
         if (need(12))
@@ -761,6 +772,79 @@ unsigned int Rayneo_GetApiVersion(void)
     return RAYNEO_API_VERSION;
 }
 
+RAYNEO_Result Rayneo_Discovery(RAYNEO_VidPid *devices, size_t capacity, size_t *outCount)
+{
+    if (!outCount)
+        return RAYNEO_ERR_INVALID_ARG;
+    *outCount = 0;
+    if (!devices && capacity != 0)
+        return RAYNEO_ERR_INVALID_ARG;
+
+    constexpr auto supported = Rayneo_GetSupportedDevices();
+    bool found[RAYNEO_SUPPORTED_DEVICE_COUNT]{};
+    auto record = [&](int vid, int pid) {
+        for (size_t i = 0; i < supported.size(); ++i)
+            if (supported[i].vid == vid && supported[i].pid == pid)
+                found[i] = true;
+    };
+#ifdef __APPLE__
+    IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+    if (!manager)
+        return RAYNEO_ERR_GENERAL;
+    IOHIDManagerSetDeviceMatching(manager, nullptr);
+    CFSetRef deviceSet = IOHIDManagerCopyDevices(manager);
+    if (deviceSet)
+    {
+        struct DiscoveryState {
+            decltype(record) *recordDevice;
+        } state{&record};
+        CFSetApplyFunction(deviceSet, [](const void *value, void *context) {
+            auto device = static_cast<IOHIDDeviceRef>(const_cast<void *>(value));
+            auto *state = static_cast<DiscoveryState *>(context);
+            (*state->recordDevice)(macGetDeviceInt(device, CFSTR(kIOHIDVendorIDKey)),
+                                   macGetDeviceInt(device, CFSTR(kIOHIDProductIDKey)));
+        }, &state);
+        CFRelease(deviceSet);
+    }
+    CFRelease(manager);
+#else
+    libusb_context *usb = nullptr;
+    if (libusb_init(&usb) != 0)
+        return RAYNEO_ERR_GENERAL;
+    libusb_device **list = nullptr;
+    const ssize_t count = libusb_get_device_list(usb, &list);
+    if (count < 0)
+    {
+        libusb_exit(usb);
+        return RAYNEO_ERR_IO;
+    }
+    for (ssize_t i = 0; i < count; ++i)
+    {
+        libusb_device_descriptor descriptor{};
+        if (libusb_get_device_descriptor(list[i], &descriptor) == 0)
+            record(descriptor.idVendor, descriptor.idProduct);
+    }
+    libusb_free_device_list(list, 1);
+    libusb_exit(usb);
+#endif
+    for (size_t i = 0; i < supported.size(); ++i)
+    {
+        if (!found[i])
+            continue;
+        // Multiple models may intentionally share one USB identity.
+        bool duplicate = false;
+        for (size_t j = 0; j < i; ++j)
+            if (found[j] && supported[j].vid == supported[i].vid && supported[j].pid == supported[i].pid)
+                duplicate = true;
+        if (duplicate)
+            continue;
+        if (*outCount < capacity)
+            devices[*outCount] = supported[i];
+        ++*outCount;
+    }
+    return RAYNEO_OK;
+}
+
 RAYNEO_Result Rayneo_Create(RAYNEO_Context *outCtx)
 {
     if (!outCtx)
@@ -1021,7 +1105,7 @@ RAYNEO_Result Rayneo_Start(RAYNEO_Context ctx, uint32_t /*serviceFlags*/)
         {
             libusb_detach_kernel_driver(ctx->handle, ctx->interfaceNumber);
         }
-        
+
         int cRc = libusb_claim_interface(ctx->handle, ctx->interfaceNumber);
         if (cRc != 0)
         {
